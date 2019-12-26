@@ -176,23 +176,22 @@ dmem_panic(const char *fmt, ...)
  */
 #define INIT_BUFSIZE (4 * 1024)
 static char init_buf[INIT_BUFSIZE] = {0};
-static size_t init_buf_pos = 0;
 
 static void *
 init_malloc(size_t size)
 {
-	assert(init_buf_pos + size < sizeof(init_buf));
-	void *retp = init_buf + init_buf_pos;
-	init_buf_pos += size;
+	static size_t init_buf_idx = 0;
+
+	size_t idx = __sync_fetch_and_add(&init_buf_idx, size);
+	assert(idx + size < sizeof(init_buf));
+	void *retp = init_buf + idx;
 	return retp;
 }
 
 static void *
 init_calloc(size_t nmemb, size_t size)
 {
-	size_t whole_size = nmemb * size;
-	assert(whole_size < sizeof(init_buf));
-	return init_malloc(whole_size);
+	return init_malloc(nmemb * size);
 }
 
 static void *
