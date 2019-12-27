@@ -108,6 +108,48 @@ dmem_panic(const char *fmt, ...)
 	va_end(va);
 }
 
+#define DMEM_OPT_STR "DMEM_OPTS"
+#define DMEM_OPT_LEN 512
+
+typedef struct dmem_opt {
+	const char *opt_name;
+	size_t *opt_valp;
+} dmem_opt_t;
+
+static size_t dmem_log_all = 0;
+
+static void
+dmem_options_parse()
+{
+	const char *envstr = getenv(DMEM_OPT_STR);
+	if (envstr == NULL)
+		return;
+
+	size_t envstr_len = strlen(envstr);
+	if (envstr_len > DMEM_OPT_LEN) {
+		dmem_panic("dmem_options_parse(): %s passed is "
+			"%ld characters (limit: %d)\n",
+			DMEM_OPT_STR, envstr_len, DMEM_OPT_LEN);
+	}
+
+	char *str = alloca(strlen(envstr) + 1);
+	(void) strcpy(str, envstr);
+
+	dmem_opt_t options[] = {
+		{ "log-all", &dmem_log_all },
+	};
+	dmem_opt_t *options_end = (void *)options + sizeof (options);
+
+	char *opt = NULL;
+	while ((opt = strsep(&str, ",")) != NULL) {
+		for (dmem_opt_t *o = options; o < options_end; o++) {
+			if (strcmp(o->opt_name, opt) == 0) {
+				*o->opt_valp = 1;
+			}
+		}
+	}
+}
+
 /*
  * = Interposition Of Functions and Initialization
  *
@@ -247,6 +289,7 @@ dmem_init()
 
 	assert(!initialization);
 	initialization = true;
+
 	assert(backend_calloc == NULL);
 	assert(backend_free == NULL);
 	assert(backend_realloc == NULL);
@@ -255,6 +298,9 @@ dmem_init()
 	backend_free = dmem_dlsym("free");
 	backend_calloc = dmem_dlsym("calloc");
 	backend_realloc = dmem_dlsym("realloc");
+
+	dmem_options_parse();
+
 	initialization = false;
 }
 
@@ -268,7 +314,9 @@ malloc(size_t size)
 	}
 
 	void *p = backend_malloc(size);
-	dmem_printf("malloc(%ld) = %p\n", size, p);
+
+	if (dmem_log_all)
+		dmem_printf("malloc(%ld) = %p\n", size, p);
 	return p;
 }
 
@@ -282,7 +330,9 @@ calloc(size_t nmemb, size_t size)
 	}
 
 	void *p = backend_calloc(nmemb, size);
-	dmem_printf("calloc(%ld, %ld) = %p\n", nmemb, size, p);
+
+	if (dmem_log_all)
+		dmem_printf("calloc(%ld, %ld) = %p\n", nmemb, size, p);
 	return p;
 }
 
@@ -296,7 +346,9 @@ realloc(void *ptr, size_t size)
 	}
 
 	void *p = backend_realloc(ptr, size);
-	dmem_printf("realloc(%p, %ld) = %p\n", ptr, size, p);
+
+	if (dmem_log_all)
+		dmem_printf("realloc(%p, %ld) = %p\n", ptr, size, p);
 	return p;
 }
 
@@ -311,5 +363,7 @@ free(void *ptr)
 	}
 
 	backend_free(ptr);
-	dmem_printf("free(%p)\n", ptr);
+
+	if (dmem_log_all)
+		dmem_printf("free(%p)\n", ptr);
 }
