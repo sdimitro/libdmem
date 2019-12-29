@@ -27,6 +27,8 @@
 #include <unistd.h>
 
 /*
+ * = Printing From Within The Library
+ *
  * There are implementations of libc where printf and friends do heap
  * allocations. For this reason, we implement our own version of them
  * that don't allocate anything on the heap (e.g. no calls to malloc())
@@ -40,8 +42,8 @@
  * pointer [normal allocation] but our malloc() prints to stderr for
  * debugging purposes by calling printf() which calls into malloc()
  * again [internal allocation]). A lot of the code for these functions
- * has been borrowed by libvmem mentioned above published under the
- * same license.
+ * has been borrowed by libvmem mentioned later that is published under
+ * the same license.
  */
 #define DMEM_PRINT_BUF 1024
 #define DMEM_PRINT_LOG 8192
@@ -117,6 +119,7 @@ typedef struct dmem_opt {
 } dmem_opt_t;
 
 static size_t dmem_log_all = 0;
+static size_t dmem_findleaks = 0;
 
 static void
 dmem_options_parse()
@@ -137,6 +140,7 @@ dmem_options_parse()
 
 	dmem_opt_t options[] = {
 		{ "log-all", &dmem_log_all },
+		{ "report-leaks", &dmem_findleaks },
 	};
 	dmem_opt_t *options_end = (void *)options + sizeof (options);
 
@@ -149,6 +153,118 @@ dmem_options_parse()
 		}
 	}
 }
+
+/*
+ * = Tracking Allocations
+ *
+ * We track allocated segments by asking the underlying malloc()
+ * implementation for slightly larger segments so we can prepend
+ * each segment with a tag (dmem_alloc_entry_t) that we use to
+ * implement the majority of our functionality. The tag's most
+ * basic job is to link together all segments in a doubly-linked
+ * list.
+ *
+ * The main advantages of this approach are:
+ * - Metadata access and retrieval operations for each segment
+ *   are O(1).
+ * - There is no need for separate calls to malloc() as data
+ *   and metadata are bundled together.
+ *
+ * The main disadvantages are:
+ * - The pointers that we get and return to the user cannot be
+ *   passed as-is to the underlying malloc() because of our tags.
+ *   Generally speaking that shouldn't be a problem assuming
+ *   we've covered all the malloc() family, but we could blow
+ *   up on scenarios where the application tries to do something
+ *   *smart*.
+ * - We can't track anything about frees.
+ */
+typedef struct dmem_alloc_entry {
+	struct dmem_alloc_entry *next;
+	struct dmem_alloc_entry *prev;
+} dmem_alloc_entry_t;
+
+static dmem_alloc_entry_t dmem_alloc_list_head = {
+	.next = &dmem_alloc_list_head,
+	.prev = &dmem_alloc_list_head,
+};
+
+static pthread_mutex_t dmem_alloc_list_lock;
+
+static uint64_t dmem_metadata_bytes = 0;
+
+static inline size_t
+__attribute__((always_inline))
+__attribute__((pure))
+dmem_alloc_entry_full_size(size_t payload_size)
+{
+	return (payload_size + sizeof (dmem_alloc_entry_t));
+}
+
+static inline dmem_alloc_entry_t *
+__attribute__((always_inline))
+__attribute__((pure))
+dmem_alloc_entry_get_from_ptr(void *ptr)
+{
+	return (ptr - sizeof(dmem_alloc_entry_t));
+}
+
+static inline void *
+__attribute__((always_inline))
+__attribute__((pure))
+dmem_alloc_entry_get_ptr(dmem_alloc_entry_t *dae)
+{
+	return ((void *)((uintptr_t)dae) + sizeof(dmem_alloc_entry_t));
+}
+
+static void
+dmem_alloc_entry_add(dmem_alloc_entry_t *dae)
+{
+	(void) pthread_mutex_lock(&dmem_alloc_list_lock);
+
+	dae->next = dmem_alloc_list_head.next;
+	dae->next->prev = dae;
+	dae->prev = &dmem_alloc_list_head;
+	dmem_alloc_list_head.next = dae;
+
+	dmem_metadata_bytes += sizeof (dmem_alloc_entry_t);
+
+	(void) pthread_mutex_unlock(&dmem_alloc_list_lock);
+}
+
+static void
+dmem_alloc_entry_remove(dmem_alloc_entry_t *dae)
+{
+
+	(void) pthread_mutex_lock(&dmem_alloc_list_lock);
+
+	dae->next->prev = dae->prev;
+	dae->prev->next = dae->next;
+
+	dmem_metadata_bytes -= sizeof (dmem_alloc_entry_t);
+
+	(void) pthread_mutex_unlock(&dmem_alloc_list_lock);
+}
+
+static void
+dmem_alloc_report_leaks()
+{
+	uint64_t nleaks = 0;
+	for (dmem_alloc_entry_t *e = dmem_alloc_list_head.next;
+	    e != &dmem_alloc_list_head; e = e->next) {
+		if (dmem_log_all) {
+			dmem_printf("libdmem: leaked: %p\n",
+			    dmem_alloc_entry_get_ptr(e));
+		}
+		nleaks++;
+	}
+
+	if (nleaks == 0)
+		return;
+
+	dmem_printf("libdmem: # leaks found - %ld\n", nleaks);
+}
+
 
 /*
  * = Interposition Of Functions and Initialization
@@ -231,9 +347,9 @@ init_malloc(size_t size)
 }
 
 static void *
-init_calloc(size_t nmemb, size_t size)
+init_calloc(size_t nelem, size_t size)
 {
-	return init_malloc(nmemb * size);
+	return init_malloc(nelem * size);
 }
 
 static void *
@@ -246,8 +362,7 @@ init_realloc(void *ptr, size_t size)
 	 * that it copies extra data (potentially from neighboring segments)
 	 * hopefully will never matter.
 	 */
-	for (size_t i = 0; i < size; i++)
-		newp[i] = *(((char *)ptr) + i);
+	(void) memmove(newp, ptr, size);
 	return newp;
 }
 
@@ -304,6 +419,15 @@ dmem_init()
 	initialization = false;
 }
 
+static void
+__attribute__((destructor))
+dmem_fini()
+{
+	if (dmem_findleaks) {
+		dmem_alloc_report_leaks();
+	}
+}
+
 void *
 malloc(size_t size)
 {
@@ -313,7 +437,17 @@ malloc(size_t size)
 		dmem_init();
 	}
 
-	void *p = backend_malloc(size);
+	size_t dmem_size = size;
+	if (dmem_findleaks) {
+		dmem_size = dmem_alloc_entry_full_size(size);
+	}
+
+	void *p = backend_malloc(dmem_size);
+
+	if (dmem_findleaks) {
+		dmem_alloc_entry_add(p);
+		p = dmem_alloc_entry_get_ptr(p);
+	}
 
 	if (dmem_log_all)
 		dmem_printf("malloc(%ld) = %p\n", size, p);
@@ -321,18 +455,47 @@ malloc(size_t size)
 }
 
 void *
-calloc(size_t nmemb, size_t size)
+calloc(size_t nelem, size_t size)
 {
 	if (initialization) {
-	    return init_calloc(nmemb, size);
+	    return init_calloc(nelem, size);
 	} else if (backend_calloc == NULL) {
 		dmem_init();
 	}
 
-	void *p = backend_calloc(nmemb, size);
+	size_t dmem_nelem = nelem, dmem_size = size;
+	if (dmem_findleaks) {
+		/*
+		 * The following logic was implemented as a placeholder
+		 * until we come up with something better and has the
+		 * following problems:
+		 *
+		 * [1] If we have a lot of small elements the memory
+		 *     overhead incured can be severe (e.g. 1000
+		 *     4-byte elements, normally around ~4KB, would
+		 *     now consume ~20KB which is 5x more).
+		 *
+		 * [2] The memory overhead will also be severe for
+		 *     elements that are too big (e.g. allocating
+		 *     one 1MB element, would consume 2MBs now).
+		 */
+		size_t metadata_size = sizeof (dmem_alloc_entry_t);
+		if (size < metadata_size) {
+			dmem_size = metadata_size;
+		} else {
+			dmem_nelem += 1;
+		}
+	}
+
+	void *p = backend_calloc(dmem_nelem, dmem_size);
+
+	if (dmem_findleaks) {
+		dmem_alloc_entry_add(p);
+		p = dmem_alloc_entry_get_ptr(p);
+	}
 
 	if (dmem_log_all)
-		dmem_printf("calloc(%ld, %ld) = %p\n", nmemb, size, p);
+		dmem_printf("calloc(%ld, %ld) = %p\n", nelem, size, p);
 	return p;
 }
 
@@ -345,7 +508,32 @@ realloc(void *ptr, size_t size)
 		dmem_init();
 	}
 
-	void *p = backend_realloc(ptr, size);
+	void *dmem_ptr = ptr;
+	size_t dmem_size = size;
+	if (dmem_findleaks) {
+		/*
+		 * It is possible that a consumer supplies a NULL
+		 * pointer to realloc() in which case it's supposed
+		 * to work like malloc().
+		 */
+		if (ptr != NULL) {
+			dmem_ptr = dmem_alloc_entry_get_from_ptr(ptr);
+			dmem_alloc_entry_remove(dmem_ptr);
+		}
+		dmem_size = dmem_alloc_entry_full_size(size);
+	}
+
+	void *p = backend_realloc(dmem_ptr, dmem_size);
+
+	/*
+	 * It is possible that a consumer supplies 0 as the
+	 * size to realloc() in which case it's supposed to
+	 * work like free().
+	 */
+	if (dmem_findleaks && size > 0) {
+		dmem_alloc_entry_add(p);
+		p = dmem_alloc_entry_get_ptr(p);
+	}
 
 	if (dmem_log_all)
 		dmem_printf("realloc(%p, %ld) = %p\n", ptr, size, p);
@@ -355,6 +543,9 @@ realloc(void *ptr, size_t size)
 void
 free(void *ptr)
 {
+	if (ptr == NULL)
+		return;
+
 	if (initialization) {
 	    init_free(ptr);
 	    return;
@@ -362,7 +553,13 @@ free(void *ptr)
 		dmem_init();
 	}
 
-	backend_free(ptr);
+	void *dmem_ptr = ptr;
+	if (dmem_findleaks) {
+		dmem_ptr = dmem_alloc_entry_get_from_ptr(ptr);
+		dmem_alloc_entry_remove(dmem_ptr);
+	}
+
+	backend_free(dmem_ptr);
 
 	if (dmem_log_all)
 		dmem_printf("free(%p)\n", ptr);
