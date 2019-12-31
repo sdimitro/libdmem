@@ -42,8 +42,9 @@
  * pointer [normal allocation] but our malloc() prints to stderr for
  * debugging purposes by calling printf() which calls into malloc()
  * again [internal allocation]). A lot of the code for these functions
- * has been borrowed by libvmem mentioned later that is published under
+ * has been borrowed by libvmem referenced below that is published under
  * the same license.
+ * - libvmem: github.com/thecodeteam/dssd/blob/master/lib/libvmem
  */
 #define DMEM_PRINT_BUF 1024
 #define DMEM_PRINT_LOG 8192
@@ -110,6 +111,53 @@ dmem_panic(const char *fmt, ...)
 	va_end(va);
 }
 
+/*
+ * = Miscellaneous Wrappers
+ */
+static void *
+dmem_dlsym_impl(void *handle, char *sym)
+{
+	/*
+	 * Clear any existing errors before dlsym() call
+	 */
+	dlerror();
+
+	void *loaded_sym = dlsym(handle, sym);
+	char *dlerr = dlerror();
+	if (dlerr != NULL) {
+		dmem_panic("dmem: dmem_dlsym(%s): %s\n", sym, dlerr);
+	}
+
+	return loaded_sym;
+}
+
+static void *
+dmem_dlsym(char *sym)
+{
+	return dmem_dlsym_impl(RTLD_NEXT, sym);
+}
+
+
+static void *
+dmem_dlopen(char *shared_obj)
+{
+	/*
+	 * Clear any existing errors before dlsym() call
+	 */
+	dlerror();
+
+	void *handle = dlopen (shared_obj, RTLD_LAZY);
+	char *dlerr = dlerror();
+	if (dlerr != NULL) {
+		dmem_panic("dmem: dmem_dlopen(%s): %s\n", shared_obj, dlerr);
+	}
+
+	return handle;
+}
+
+/*
+ * = Runtime Configuration Through DMEM_OPTS
+ */
 #define DMEM_OPT_STR "DMEM_OPTS"
 #define DMEM_OPT_LEN 512
 
@@ -118,8 +166,9 @@ typedef struct dmem_opt {
 	size_t *opt_valp;
 } dmem_opt_t;
 
-static size_t dmem_log_all = 0;
-static size_t dmem_findleaks = 0;
+static size_t dmem_trace_stderr = 0;
+static size_t dmem_log_allocs = 0;
+static size_t dmem_abort_on_shutdown = 0;
 
 static void
 dmem_options_parse()
@@ -139,8 +188,9 @@ dmem_options_parse()
 	(void) strcpy(str, envstr);
 
 	dmem_opt_t options[] = {
-		{ "log-all", &dmem_log_all },
-		{ "report-leaks", &dmem_findleaks },
+		{ "trace-stderr", &dmem_trace_stderr },
+		{ "log-allocs", &dmem_log_allocs },
+		{ "abort-shutdown", &dmem_abort_on_shutdown },
 	};
 	dmem_opt_t *options_end = (void *)options + sizeof (options);
 
@@ -152,6 +202,118 @@ dmem_options_parse()
 			}
 		}
 	}
+}
+
+/*
+ * = Recording The Stack Traces of Allocations
+ *
+ * At times we may want to record the stack traces at which allocations
+ * occur like when we want to see where a memory leak came from or which
+ * part of our code allocates the most memory. In this current iteration
+ * of libdmem we reserve extra space with our tags for that exact reason,
+ * to store the program counters that are part of the stack for each
+ * allocation (currently we limit that stack trace to a specific amount
+ * of frames to control the space overhead of our tags - refer to
+ * DMEM_TX_MAX_STACK_DEPTH for details). It also saves the thread pointer
+ * of the thread that did the allocation, which can be helpful for
+ * multithreaded apps (assuming they are using pthreads as their threading
+ * mechanism).
+ *
+ * There are multiple tradeoffs involved in deciding on how to properly
+ * record a backtrace:
+ *
+ * [1] Use __builtin_return_address provided by the GCC compiler runtime
+ *     (see https://gcc.gnu.org/onlinedocs/gcc/Return-Address.html). The
+ *     problem is that this approach requires all the code on the stack
+ *     to have been compiled with the same GCC options which is unlikely.
+ * [2] Use the debugger runtime, like glibc's backtrace(3). The issue
+ *     with this is that by default calls to malloc() are made which would
+ *     be problematic for our use-case.
+ * [3] Use the ABI. Solaris and illumos provide a frame structure with
+ *     specific stack alignment and routines to determine the current
+ *     thread stack. Unfortunately, none of this is available to Linux.
+ * [4] Supply -fno-omit-frame-pointer as an option at compile time for
+ *     libdmem AND any program/library that will be debugged by it.
+ *     Then use __builtin_frame_address(0) from libdmem to return the
+ *     correct starting point and go from there. This can be thought as
+ *     a variation of [1] and it is a bit against our attempt to try to
+ *     use libdmem in a wide-range of situations.
+ *
+ * With the above in mind, I spend some time examining solution [2] further
+ * and seeing the places where the memory allocations took place and see if
+ * I can avoid them and at first glance I believe I was able to do so. The
+ * main allocation that I could find happening from backtrace(3) was from
+ * the call to dlopen() and the subsequent calls to dlsym() on the first time
+ * the fuction was called. Examining its code further those seems to have
+ * originated by lazily initializing the function pointers to the following
+ * functions from the GCC runtime: _Unwind_Backtrace() & _Unwind_GetIP().
+ * No further allocations seemed to have taken place. Thus, I decided to
+ * basically implement a variant of backtrace(3) which strictly loads the
+ * above two function during the initialization of libdmem and have their
+ * dlsym() calls allocate memory from the init buffer of libdmem.
+ */
+#define DMEM_TX_MAX_STACK_DEPTH 11
+
+typedef struct dmem_tx {
+	pthread_t dt_thread;
+	void *dt_stack[DMEM_TX_MAX_STACK_DEPTH];
+} dmem_tx_t;
+
+#define LIBGCC_S_SO "libgcc_s.so.1"
+static void* dmem_libgcc_s_hdl = NULL;
+
+/*
+ * Note that for the backend functions below the actual return
+ * types and some of the argument types are not void pointers
+ * but we declare them as such because its easy and because
+ * they are private data that we don't care about.
+ */
+static void* (*backend_unwind_backtrace)(void *, void *) = NULL;
+static void* (*backend_unwind_get_ip)(void *) = NULL;
+
+static void
+dmem_load_unwind_backtrace()
+{
+	assert(dmem_libgcc_s_hdl == NULL);
+	assert(backend_unwind_backtrace == NULL);
+	assert(backend_unwind_get_ip == NULL);
+
+	dmem_libgcc_s_hdl = dmem_dlopen(LIBGCC_S_SO);
+	backend_unwind_backtrace = dmem_dlsym_impl(dmem_libgcc_s_hdl,
+	    "_Unwind_Backtrace");
+	backend_unwind_get_ip = dmem_dlsym_impl(dmem_libgcc_s_hdl,
+	    "_Unwind_GetIP");
+}
+
+/*
+ * This enum resembles _Unwid_Reason_Code from unwind.h and are
+ * defined to conform with the API interface of the callbacks of
+ * _Unwind_Backtrace() [see dmem_bt_cb()}.
+ */
+typedef enum dmem_bt_codes {
+	DBC_CONTINUE = 0,
+	DBC_STOP = 4,
+	DBC_END_OF_STACK = 5,
+} dmem_bt_codes_t;
+
+typedef struct dmem_bt_cb_arg {
+	void **bca_stack;
+	int bca_limit;
+	int bca_count;
+} dmem_bt_cb_arg_t;
+
+static int
+dmem_bt_cb(void *ctx, void *priv)
+{
+	dmem_bt_cb_arg_t *bca = priv;
+
+	if (bca->bca_limit == bca->bca_count)
+		return DBC_STOP;
+
+	bca->bca_stack[bca->bca_count] = (void *) backend_unwind_get_ip(ctx);
+	bca->bca_count++;
+
+	return DBC_CONTINUE;
 }
 
 /*
@@ -180,13 +342,15 @@ dmem_options_parse()
  * - We can't track anything about frees.
  */
 typedef struct dmem_alloc_entry {
-	struct dmem_alloc_entry *next;
-	struct dmem_alloc_entry *prev;
+	struct dmem_alloc_entry *dae_next;
+	struct dmem_alloc_entry *dae_prev;
+	dmem_tx_t dae_tx;
 } dmem_alloc_entry_t;
 
 static dmem_alloc_entry_t dmem_alloc_list_head = {
-	.next = &dmem_alloc_list_head,
-	.prev = &dmem_alloc_list_head,
+	.dae_next = &dmem_alloc_list_head,
+	.dae_prev = &dmem_alloc_list_head,
+	.dae_tx = {},
 };
 
 static pthread_mutex_t dmem_alloc_list_lock;
@@ -218,18 +382,41 @@ dmem_alloc_entry_get_ptr(dmem_alloc_entry_t *dae)
 }
 
 static void
+dmem_alloc_entry_record_tx(dmem_alloc_entry_t *dae)
+{
+	dae->dae_tx = (dmem_tx_t) {
+		.dt_thread = pthread_self(),
+		.dt_stack = {0},
+	};
+	dmem_bt_cb_arg_t bae = {
+		.bca_stack = dae->dae_tx.dt_stack,
+		.bca_limit = DMEM_TX_MAX_STACK_DEPTH,
+		.bca_count = 0,
+	};
+
+	/*
+	 * NOTE: We don't do any kind of error-handling
+	 * here for now.
+	 */
+	(void) backend_unwind_backtrace(dmem_bt_cb, &bae);
+}
+
+
+static void
 dmem_alloc_entry_add(dmem_alloc_entry_t *dae)
 {
 	(void) pthread_mutex_lock(&dmem_alloc_list_lock);
 
-	dae->next = dmem_alloc_list_head.next;
-	dae->next->prev = dae;
-	dae->prev = &dmem_alloc_list_head;
-	dmem_alloc_list_head.next = dae;
+	dae->dae_next = dmem_alloc_list_head.dae_next;
+	dae->dae_next->dae_prev = dae;
+	dae->dae_prev = &dmem_alloc_list_head;
+	dmem_alloc_list_head.dae_next = dae;
 
 	dmem_metadata_bytes += sizeof (dmem_alloc_entry_t);
 
 	(void) pthread_mutex_unlock(&dmem_alloc_list_lock);
+
+	dmem_alloc_entry_record_tx(dae);
 }
 
 static void
@@ -238,33 +425,13 @@ dmem_alloc_entry_remove(dmem_alloc_entry_t *dae)
 
 	(void) pthread_mutex_lock(&dmem_alloc_list_lock);
 
-	dae->next->prev = dae->prev;
-	dae->prev->next = dae->next;
+	dae->dae_next->dae_prev = dae->dae_prev;
+	dae->dae_prev->dae_next = dae->dae_next;
 
 	dmem_metadata_bytes -= sizeof (dmem_alloc_entry_t);
 
 	(void) pthread_mutex_unlock(&dmem_alloc_list_lock);
 }
-
-static void
-dmem_alloc_report_leaks()
-{
-	uint64_t nleaks = 0;
-	for (dmem_alloc_entry_t *e = dmem_alloc_list_head.next;
-	    e != &dmem_alloc_list_head; e = e->next) {
-		if (dmem_log_all) {
-			dmem_printf("libdmem: leaked: %p\n",
-			    dmem_alloc_entry_get_ptr(e));
-		}
-		nleaks++;
-	}
-
-	if (nleaks == 0)
-		return;
-
-	dmem_printf("libdmem: # leaks found - %ld\n", nleaks);
-}
-
 
 /*
  * = Interposition Of Functions and Initialization
@@ -321,9 +488,8 @@ dmem_alloc_report_leaks()
  *   ready to start serving malloc() calls and friends for the main
  *   process.
  *
- * Note that like the rest of the current code in this library, the
- * initialization step wouldn't work in a concurrent settings as it
- * currently has no locks to guard its internal structures.
+ * Note the initialization step wouldn't work in a concurrent settings
+ * as it currently has no locks to guard its internal structures.
  */
 
 /*
@@ -372,19 +538,6 @@ init_free(void *ptr)
 	/* no-op */
 }
 
-
-static void *
-dmem_dlsym(char *sym)
-{
-	dlerror(); /* clear any existing errors before dlsym() call  */
-	void *loaded_sym = dlsym(RTLD_NEXT, sym);
-	char *dlerr = dlerror();
-	if (dlerr != NULL) {
-		dmem_panic("dmem: dmem_dlsym(%s): %s\n", sym, dlerr);
-	}
-	return loaded_sym;
-}
-
 static bool initialization = false;
 static void* (*backend_malloc)(size_t) = NULL;
 static void* (*backend_calloc)(size_t, size_t) = NULL;
@@ -414,6 +567,7 @@ dmem_init()
 	backend_calloc = dmem_dlsym("calloc");
 	backend_realloc = dmem_dlsym("realloc");
 
+	dmem_load_unwind_backtrace();
 	dmem_options_parse();
 
 	initialization = false;
@@ -423,9 +577,10 @@ static void
 __attribute__((destructor))
 dmem_fini()
 {
-	if (dmem_findleaks) {
-		dmem_alloc_report_leaks();
-	}
+	if (dmem_libgcc_s_hdl != NULL)
+		dlclose(dmem_libgcc_s_hdl);
+	if (dmem_abort_on_shutdown)
+		abort();
 }
 
 void *
@@ -438,18 +593,17 @@ malloc(size_t size)
 	}
 
 	size_t dmem_size = size;
-	if (dmem_findleaks) {
+	if (dmem_log_allocs) {
 		dmem_size = dmem_alloc_entry_full_size(size);
 	}
 
 	void *p = backend_malloc(dmem_size);
-
-	if (dmem_findleaks) {
+	if (dmem_log_allocs) {
 		dmem_alloc_entry_add(p);
 		p = dmem_alloc_entry_get_ptr(p);
 	}
 
-	if (dmem_log_all)
+	if (dmem_trace_stderr)
 		dmem_printf("malloc(%ld) = %p\n", size, p);
 	return p;
 }
@@ -458,13 +612,13 @@ void *
 calloc(size_t nelem, size_t size)
 {
 	if (initialization) {
-	    return init_calloc(nelem, size);
+		return init_calloc(nelem, size);
 	} else if (backend_calloc == NULL) {
 		dmem_init();
 	}
 
 	size_t dmem_nelem = nelem, dmem_size = size;
-	if (dmem_findleaks) {
+	if (dmem_log_allocs) {
 		/*
 		 * The following logic was implemented as a placeholder
 		 * until we come up with something better and has the
@@ -473,7 +627,7 @@ calloc(size_t nelem, size_t size)
 		 * [1] If we have a lot of small elements the memory
 		 *     overhead incured can be severe (e.g. 1000
 		 *     4-byte elements, normally around ~4KB, would
-		 *     now consume ~20KB which is 5x more).
+		 *     now consume ~120KB - 30x more).
 		 *
 		 * [2] The memory overhead will also be severe for
 		 *     elements that are too big (e.g. allocating
@@ -481,20 +635,19 @@ calloc(size_t nelem, size_t size)
 		 */
 		size_t metadata_size = sizeof (dmem_alloc_entry_t);
 		if (size < metadata_size) {
-			dmem_size = metadata_size;
+			dmem_size += metadata_size;
 		} else {
 			dmem_nelem += 1;
 		}
 	}
 
 	void *p = backend_calloc(dmem_nelem, dmem_size);
-
-	if (dmem_findleaks) {
+	if (dmem_log_allocs) {
 		dmem_alloc_entry_add(p);
 		p = dmem_alloc_entry_get_ptr(p);
 	}
 
-	if (dmem_log_all)
+	if (dmem_trace_stderr)
 		dmem_printf("calloc(%ld, %ld) = %p\n", nelem, size, p);
 	return p;
 }
@@ -503,14 +656,14 @@ void *
 realloc(void *ptr, size_t size)
 {
 	if (initialization) {
-	    return init_realloc(ptr, size);
+		return init_realloc(ptr, size);
 	} else if (backend_realloc == NULL) {
 		dmem_init();
 	}
 
 	void *dmem_ptr = ptr;
 	size_t dmem_size = size;
-	if (dmem_findleaks) {
+	if (dmem_log_allocs) {
 		/*
 		 * It is possible that a consumer supplies a NULL
 		 * pointer to realloc() in which case it's supposed
@@ -530,12 +683,12 @@ realloc(void *ptr, size_t size)
 	 * size to realloc() in which case it's supposed to
 	 * work like free().
 	 */
-	if (dmem_findleaks && size > 0) {
+	if (dmem_log_allocs && size > 0) {
 		dmem_alloc_entry_add(p);
 		p = dmem_alloc_entry_get_ptr(p);
 	}
 
-	if (dmem_log_all)
+	if (dmem_trace_stderr)
 		dmem_printf("realloc(%p, %ld) = %p\n", ptr, size, p);
 	return p;
 }
@@ -547,20 +700,19 @@ free(void *ptr)
 		return;
 
 	if (initialization) {
-	    init_free(ptr);
-	    return;
+		init_free(ptr);
+		return;
 	} else if (backend_free == NULL) {
 		dmem_init();
 	}
 
 	void *dmem_ptr = ptr;
-	if (dmem_findleaks) {
+	if (dmem_log_allocs) {
 		dmem_ptr = dmem_alloc_entry_get_from_ptr(ptr);
 		dmem_alloc_entry_remove(dmem_ptr);
 	}
 
 	backend_free(dmem_ptr);
-
-	if (dmem_log_all)
+	if (dmem_trace_stderr)
 		dmem_printf("free(%p)\n", ptr);
 }
